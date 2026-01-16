@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Portal 统一管理平台</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        :root { --primary: #1677ff; --bg: #f0f2f5; --white: #ffffff; --text: #333; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; display: flex; height: 100vh; background: var(--bg); color: var(--text); }
+        .sidebar { width: 240px; background: #001529; color: rgba(255,255,255,0.65); display: flex; flex-direction: column; }
+        .logo { height: 64px; line-height: 64px; padding-left: 24px; font-size: 20px; font-weight: 700; color: #fff; background: #002140; }
+        .menu-item { padding: 16px 24px; cursor: pointer; transition: 0.3s; font-size: 14px; }
+        .menu-item.active { background: var(--primary); color: #fff; }
+        .logout { margin-top: auto; padding: 16px 24px; background: #002140; cursor: pointer; color: #ff4d4f; }
+        .main { flex: 1; padding: 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 24px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        h2 { margin: 0; font-size: 24px; font-weight: 600; }
+        .card { background: var(--white); border-radius: 8px; padding: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+        .stat-card { display: flex; align-items: center; padding: 24px; border-radius: 12px; }
+        .stat-card.blue { background: linear-gradient(135deg, #e6f4ff 0%, #bae0ff 100%); }
+        .stat-card.green { background: linear-gradient(135deg, #f6ffed 0%, #d9f7be 100%); }
+        .stat-card.purple { background: linear-gradient(135deg, #f9f0ff 0%, #efdbff 100%); }
+        .stat-icon { font-size: 24px; margin-right: 16px; }
+        .stat-info div:last-child { font-size: 28px; font-weight: 700; color: #1f1f1f; }
+        .charts-row-top { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; height: 380px; }
+        .charts-row-btm { height: 320px; }
+        .chart-box { height: 100%; display: flex; flex-direction: column; }
+        .chart-title { font-size: 16px; font-weight: 600; margin-bottom: 15px; border-left: 4px solid var(--primary); padding-left: 10px; }
+        #chart-trend, #chart-fail, #chart-ap { flex: 1; width: 100%; }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th { background: #fafafa; padding: 16px; text-align: left; border-bottom: 1px solid #f0f0f0; }
+        td { padding: 16px; border-bottom: 1px solid #f0f0f0; }
+        button { cursor: pointer; border: none; padding: 6px 12px; border-radius: 4px; font-size: 13px; margin-right: 5px; }
+        .btn-primary { background: var(--primary); color: #fff; }
+        .btn-danger { background: #ff4d4f; color: #fff; }
+        .btn-default { background: #fff; border: 1px solid #d9d9d9; }
+        .btn-warn { background: #faad14; color: #fff; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .online { background: #52c41a; }
+        .expired { background: #ff4d4f; }
+        .offline { background: #d9d9d9; }
+        .tag { padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+        .tag-http { background: #e6f4ff; color: #1677ff; border: 1px solid #91caff; }
+        .tag-udp { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
+        .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none; align-items: center; justify-content: center; z-index: 1000; }
+        .modal { background: #fff; width: 480px; padding: 24px; border-radius: 8px; box-shadow: 0 6px 16px rgba(0,0,0,0.12); }
+        .form-row { margin-bottom: 16px; }
+        .form-row label { display: block; margin-bottom: 6px; font-size: 14px; color: #666; }
+        .form-row input, .form-row select { width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; box-sizing: border-box; }
+        .section { display: none; }
+        .section.active { display: block; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo">PORTAL ADMIN</div>
+        <div class="menu-item active" onclick="switchTab('dashboard')">📊 仪表盘</div>
+        <div class="menu-item" onclick="switchTab('online')">👥 用户管理</div>
+        <div class="menu-item" onclick="switchTab('audit')">📝 审计日志</div>
+        <div class="menu-item" onclick="switchTab('apac')">⚙️ 设备配置</div>
+        <div class="menu-item" onclick="switchTab('config')">🛠️ 系统参数</div>
+        <div class="menu-item" onclick="switchTab('security')">🔒 安全中心</div>
+        <a href="/admin/logout" style="text-decoration:none;"><div class="logout">🚪 退出登录</div></a>
+    </div>
+
+    <div class="main">
+        <div id="section-dashboard" class="section active">
+            <div class="header"><h2>系统概览</h2><button class="btn-default" onclick="initDashboard()">🔄 刷新</button></div>
+            <div class="stats-grid">
+                <div class="stat-card blue"><div class="stat-icon">👥</div><div class="stat-info"><div>当前在线</div><div id="stat-online">0</div></div></div>
+                <div class="stat-card green"><div class="stat-icon">📡</div><div class="stat-info"><div>接入 AP</div><div id="stat-ap">0</div></div></div>
+                <div class="stat-card purple"><div class="stat-icon">✅</div><div class="stat-info"><div>今日认证</div><div id="stat-auth">0</div></div></div>
+            </div>
+            <div class="charts-row-top" style="margin-top:24px;">
+                <div class="card chart-box"><div class="chart-title">24小时认证流量趋势 (双轨)</div><div id="chart-trend"></div></div>
+                <div class="card chart-box"><div class="chart-title">认证失败原因 Top 5</div><div id="chart-fail"></div></div>
+            </div>
+            <div class="card chart-box charts-row-btm" style="margin-top:24px;"><div class="chart-title">热门 AP 负载 Top 5</div><div id="chart-ap"></div></div>
+        </div>
+
+        <div id="section-online" class="section">
+            <div class="header"><h2>用户管理</h2><div><button class="btn-primary" onclick="openUserModal()">+ 新增白名单</button> <button class="btn-default" onclick="loadOnline()">刷新</button></div></div>
+            <div class="card"><table><thead><tr><th>用户</th><th>姓名</th><th>状态</th><th>IP</th><th>MAC</th><th>登录时间</th><th>到期时间</th><th>操作</th></tr></thead><tbody id="online-list"></tbody></table></div>
+        </div>
+
+        <div id="section-apac" class="section">
+            <div class="header"><h2>设备配置</h2><div><button class="btn-primary" onclick="openModal()">+ 新增设备</button> <button class="btn-default" onclick="loadAPAC()">刷新</button></div></div>
+            <div class="card"><table><thead><tr><th>AP MAC</th><th>AC IP</th><th>端口</th><th>协议</th><th>Secret</th><th>操作</th></tr></thead><tbody id="apac-list"></tbody></table></div>
+        </div>
+
+        <div id="section-audit" class="section"><div class="header"><h2>审计日志</h2><button class="btn-default" onclick="loadAudit()">刷新</button></div><div class="card"><table><thead><tr><th>时间</th><th>用户</th><th>IP</th><th>MAC</th><th>AP</th><th>动作</th><th>结果</th></tr></thead><tbody id="audit-list"></tbody></table></div></div>
+        <div id="section-config" class="section"><div class="header"><h2>系统参数</h2></div><div class="card" style="max-width:500px"><div class="form-row"><label>认证成功跳转</label><input id="conf-redirect"></div><div class="form-row"><label>有效期(小时)</label><input id="conf-validity" type="number"></div><button class="btn-primary" onclick="saveConfig()">保存</button></div></div>
+        <div id="section-security" class="section"><div class="header"><h2>修改密码</h2></div><div class="card" style="max-width:400px"><div class="form-row"><label>原密码</label><input type="password" id="pwd-old"></div><div class="form-row"><label>新密码</label><input type="password" id="pwd-new"></div><button class="btn-primary" onclick="changePassword()">修改</button></div></div>
+    </div>
+
+    <div class="modal-overlay" id="modal">
+        <div class="modal">
+            <h3 id="modal-title">配置 AP/AC</h3>
+            <input type="hidden" id="edit-id">
+            <div class="form-row"><label>AP MAC</label><input id="form-ap"></div>
+            <div class="form-row"><label>AC IP</label><input id="form-ac"></div>
+            <div class="form-row"><label>AC Port</label><input id="form-port" value="2000"></div>
+            <div class="form-row"><label>协议</label><select id="form-ver"><option value="0">HTTP (默认)</option><option value="1">Portal V1</option><option value="2">Portal V2</option></select></div>
+            <div class="form-row"><label>Secret</label><input id="form-secret" value="Huawei"></div>
+            <div style="text-align:right"><button class="btn-default" onclick="closeModal()">取消</button> <button class="btn-primary" onclick="saveAPAC()">保存</button></div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="modal-user">
+        <div class="modal">
+            <h3>新增用户</h3>
+            <div class="form-row"><label>账号 (手机号)</label><input id="u-name"></div>
+            <div class="form-row"><label>姓名</label><input id="u-real"></div>
+            <div class="form-row"><label>MAC (必填)</label><input id="u-mac" placeholder="如 aa:bb:cc:dd:ee:ff"></div>
+            <div class="form-row"><label>有效期 (小时)</label><input id="u-hours" type="number" value="720"></div>
+            <div style="text-align:right"><button class="btn-default" onclick="closeUserModal()">取消</button> <button class="btn-primary" onclick="saveUser()">保存</button></div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tab) {
+            document.querySelectorAll('.menu-item').forEach(el => el.classList.remove('active'));
+            event.currentTarget.classList.add('active');
+            document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
+            document.getElementById('section-' + tab).classList.add('active');
+            if(tab === 'dashboard') initDashboard(); else if(tab === 'online') loadOnline(); else if(tab === 'apac') loadAPAC(); else if(tab === 'audit') loadAudit(); else if(tab === 'config') loadConfig();
+        }
+
+        let trendChart, failChart, apChart;
+        async function initDashboard() {
+            try {
+                const res = await fetch('/admin/stats'); const d = await res.json();
+                document.getElementById('stat-online').innerText = d.online||0; document.getElementById('stat-ap').innerText = d.ap_count||0; document.getElementById('stat-auth').innerText = d.today_auth||0;
+                
+                if(!trendChart) trendChart = echarts.init(document.getElementById('chart-trend'));
+                if(!failChart) failChart = echarts.init(document.getElementById('chart-fail'));
+                if(!apChart) apChart = echarts.init(document.getElementById('chart-ap'));
+                
+                const r1 = await fetch('/admin/chart/trend'); const d1 = await r1.json();
+                trendChart.setOption({tooltip:{trigger:'axis'}, legend:{data:['认证请求','成功认证']}, grid: {left:'3%', right:'4%', bottom:'3%', containLabel:true}, xAxis:{type:'category', boundaryGap:false, data:d1.hours||[]}, yAxis:{type:'value'}, series:[{name:'认证请求', type:'line', smooth:true, data:d1.total||[], itemStyle:{color:'#999'}, lineStyle:{width:1, type:'dashed'}},{name:'成功认证', type:'line', smooth:true, areaStyle:{opacity:0.2}, data:d1.success||[], itemStyle:{color:'#1677ff'}}]});
+                
+                const rFail = await fetch('/admin/chart/failure'); const dFail = await rFail.json();
+                failChart.setOption({tooltip: {trigger:'item'}, series: [{type: 'pie', radius: ['40%', '70%'], avoidLabelOverlap: false, itemStyle: {borderRadius: 5, borderColor: '#fff', borderWidth: 2}, label: {show: false, position: 'center'}, emphasis: {label: {show: true, fontSize: 14, fontWeight: 'bold'}}, data: dFail || []}]});
+
+                const r2 = await fetch('/admin/chart/top_ap'); const d2 = await r2.json();
+                apChart.setOption({tooltip:{trigger:'axis'}, xAxis:{type:'value'}, yAxis:{type:'category',data:d2.aps||[]}, series:[{type:'bar',data:d2.counts||[],itemStyle:{color:'#52c41a', borderRadius:[0,4,4,0]}}]});
+                
+                window.onresize = function() { trendChart.resize(); failChart.resize(); apChart.resize(); };
+            } catch(e) {}
+        }
+
+        // --- 【关键修复点】 loadOnline 状态判断与按钮逻辑 ---
+        async function loadOnline() { 
+            try { 
+                const res = await fetch('/admin/online'); 
+                const d = await res.json()||[]; 
+                const now = new Date(); 
+                
+                document.getElementById('online-list').innerHTML = d.map(u => { 
+                    let exp = new Date(u.ExpiresAt); 
+                    
+                    // 1. 状态显示逻辑
+                    let st = '';
+                    if (exp <= now) {
+                        st = '<span class=\"status-dot expired\"></span>已过期';
+                    } else if (u.IsOnline) {
+                        st = '<span class=\"status-dot online\"></span>在线';
+                    } else {
+                        // 没过期，也没在线 -> 离线 (新增用户就是这个状态)
+                        st = '<span class=\"status-dot offline\"></span>离线';
+                    }
+
+                    // 2. 按钮显示逻辑
+                    // 只有在线用户才显示 "强制下线"，离线/过期的显示 "删除用户"
+                    let target = u.UserMAC || u.Username;
+                    let btnHtml = '';
+                    if (u.IsOnline) {
+                        btnHtml = '<button class=\"btn-warn\" onclick=\"kick(\''+target+'\')\">强制下线</button>';
+                    } else {
+                        btnHtml = '<button class=\"btn-danger\" onclick=\"kick(\''+target+'\')\">删除用户</button>';
+                    }
+
+                    return '<tr>' +
+                        '<td>'+u.Username+'</td>' +
+                        '<td>'+(u.RealName||'-')+'</td>' +
+                        '<td>'+st+'</td>' +
+                        '<td>'+(u.UserIP||'-')+'</td>' +
+                        '<td>'+(u.UserMAC||'-')+'</td>' +
+                        '<td>'+new Date(u.LoginTime).toLocaleString()+'</td>' +
+                        '<td>'+exp.toLocaleString()+'</td>' +
+                        '<td>'+btnHtml+'</td>' +
+                    '</tr>'; 
+                }).join(''); 
+            } catch(e) {} 
+        }
+
+        async function loadAPAC() { const res = await fetch('/admin/apac'); const d = await res.json()||[]; document.getElementById('apac-list').innerHTML = d.map(i => { let tag = i.PortalVer==2 ? '<span class=\"tag tag-udp\">V2</span>' : (i.PortalVer==1 ? '<span class=\"tag tag-udp\">V1</span>' : '<span class=\"tag tag-http\">HTTP</span>'); return '<tr><td>'+i.APMAC+'</td><td>'+i.ACIP+'</td><td>'+i.ACPort+'</td><td>'+tag+'</td><td>'+i.ACSecret+'</td><td><button class=\"btn-primary\" onclick=\'editAPAC('+JSON.stringify(i)+')\'>编辑</button> <button class=\"btn-danger\" onclick=\"delAPAC('+i.ID+')\">删除</button></td></tr>'; }).join(''); }
+        async function loadAudit() { const r=await fetch('/admin/audit'); const d=await r.json(); document.getElementById('audit-list').innerHTML=d.map(l=>'<tr><td>'+new Date(l.CreatedAt).toLocaleString()+'</td><td>'+l.Username+'</td><td>'+l.UserIP+'</td><td>'+l.UserMAC+'</td><td>'+l.APMAC+'</td><td>'+l.Action+'</td><td>'+l.Result+'</td></tr>').join(''); }
+        async function loadConfig() { const r1=await fetch('/admin/config?key=redirect_url');const d1=await r1.json();document.getElementById('conf-redirect').value=d1.value||''; const r2=await fetch('/admin/config?key=auth_validity_hours');const d2=await r2.json();document.getElementById('conf-validity').value=d2.value||24; }
+        async function saveConfig() { await fetch('/admin/config',{method:'POST',body:JSON.stringify({key:'redirect_url',value:document.getElementById('conf-redirect').value})}); await fetch('/admin/config',{method:'POST',body:JSON.stringify({key:'auth_validity_hours',value:document.getElementById('conf-validity').value})}); alert('保存成功'); }
+        function openModal() { document.getElementById('modal').style.display='flex'; document.getElementById('modal-title').innerText="新增配置"; document.getElementById('edit-id').value=''; document.getElementById('form-ap').value=''; document.getElementById('form-ac').value=''; document.getElementById('form-ver').value='0'; }
+        function editAPAC(i) { openModal(); document.getElementById('modal-title').innerText="编辑配置"; document.getElementById('edit-id').value=i.ID; document.getElementById('form-ap').value=i.APMAC; document.getElementById('form-ac').value=i.ACIP; document.getElementById('form-port').value=i.ACPort; document.getElementById('form-secret').value=i.ACSecret; document.getElementById('form-ver').value=i.PortalVer; }
+        function closeModal() { document.getElementById('modal').style.display='none'; }
+        async function saveAPAC() { const b={ID:parseInt(document.getElementById('edit-id').value)||0, APMAC:document.getElementById('form-ap').value, ACIP:document.getElementById('form-ac').value, ACPort:parseInt(document.getElementById('form-port').value), ACSecret:document.getElementById('form-secret').value, PortalVer:parseInt(document.getElementById('form-ver').value)}; await fetch('/admin/apac',{method:'POST',body:JSON.stringify(b)}); closeModal(); loadAPAC(); }
+        async function delAPAC(id) { if(confirm('删除?')) await fetch('/admin/apac/'+id,{method:'DELETE'}); loadAPAC(); }
+        function openUserModal() { document.getElementById('modal-user').style.display='flex'; document.getElementById('u-name').value=''; document.getElementById('u-mac').value=''; }
+        function closeUserModal() { document.getElementById('modal-user').style.display='none'; }
+        
+        // 这里的 kick 实际上后端执行的是 ManualLogout，既能踢人也能删库，所以复用即可，只是前端按钮文案变了
+        async function kick(t) { 
+            let msg = '确定删除该用户记录吗？';
+            // 如果是在线用户，提示词不同
+            // 但这里简化处理，统一 confirm 即可，或者通过传入参数判断
+            // 简单起见，统一弹窗
+            if(confirm('确认执行此操作?')) {
+                await fetch('/admin/kick?target='+t,{method:'POST'}); 
+                loadOnline(); 
+            }
+        }
+        
+        async function changePassword() { const o=document.getElementById('pwd-old').value, n=document.getElementById('pwd-new').value; const r=await fetch('/admin/password',{method:'POST',body:JSON.stringify({OldPassword:o,NewPassword:n})}); const d=await r.json(); alert(d.message||(d.success?'成功':'失败')); }
+        
+        async function saveUser() {
+            const body = {
+                Username: document.getElementById('u-name').value, 
+                RealName: document.getElementById('u-real').value, 
+                UserMAC:  document.getElementById('u-mac').value, 
+                Hours: parseInt(document.getElementById('u-hours').value) || 720 
+            };
+            if (!body.Username) { alert('账号必填'); return; }
+            if (!body.UserMAC) { alert('MAC 地址必填'); return; }
+            const res = await fetch('/admin/guest', {method:'POST', body:JSON.stringify(body)});
+            const d = await res.json();
+            if(d.success) { closeUserModal(); loadOnline(); alert('添加成功'); } else { alert('添加失败: ' + d.message); }
+        }
+        
+        initDashboard();
+    </script>
+</body>
+</html>

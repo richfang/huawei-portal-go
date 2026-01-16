@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>KN Guest Network Auth</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; color: #333; }
+        .card { background: white; padding: 2.5rem 2rem; border-radius: 12px; width: 90%; max-width: 380px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); position: relative; }
+        .lang-switch { position: absolute; top: 20px; right: 20px; font-size: 14px; color: #888; cursor: pointer; user-select: none; }
+        .lang-switch span { transition: color 0.2s; }
+        .lang-switch span.active { color: #1890ff; font-weight: bold; }
+        .lang-switch span:hover { color: #1890ff; }
+        h2 { text-align: center; margin-bottom: 30px; font-size: 22px; color: #000; font-weight: 600; }
+        .input-group { margin-bottom: 15px; }
+        input { width: 100%; padding: 12px 15px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; transition: border 0.2s; outline: none; }
+        input:focus { border-color: #1890ff; }
+        button { width: 100%; padding: 12px; background: #1890ff; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 10px; font-weight: 500; transition: background 0.2s; }
+        button:hover { background: #096dd9; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .msg { text-align: center; margin-top: 15px; color: #ff4d4f; font-size: 14px; min-height: 20px; }
+        .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #fff; border-radius: 50%; border-top-color: transparent; animation: spin 1s linear infinite; margin-right: 5px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .brand { color: #1890ff; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="lang-switch">
+            <span id="lang-cn" onclick="setLang('cn')" class="active">中</span> / 
+            <span id="lang-en" onclick="setLang('en')">En</span>
+        </div>
+
+        <h2 id="ui-title"><span class="brand">KN</span> 访客网络认证</h2>
+        
+        <div class="input-group">
+            <input type="tel" id="phone" placeholder="请输入手机号" maxlength="11">
+        </div>
+        
+        <button id="btn-login" onclick="login()">立即认证</button>
+        <div id="message" class="msg"></div>
+    </div>
+
+    <iframe name="hidden-frame" style="display:none;"></iframe>
+    <form id="ac-form" method="post" target="hidden-frame" style="display:none">
+        <input type="hidden" name="cmd" value="login">
+        <input type="hidden" name="username" id="ac-username">
+        <input type="hidden" name="password" id="ac-password">
+        <input type="hidden" name="ipaddress" id="ac-ipaddress">
+        <input type="hidden" name="macaddress" id="ac-macaddress">
+        <input type="hidden" name="user" id="ac-user">
+        <input type="hidden" name="wlanuserip" id="ac-wlanuserip">
+        <input type="hidden" name="wlanusermac" id="ac-wlanusermac">
+        <input type="hidden" name="wlanacname" id="ac-acname">
+        <input type="hidden" name="ssid" id="ac-ssid">
+    </form>
+
+    <script>
+        const i18n = {
+            cn: { title: '<span class="brand">KN</span> 访客网络认证', ph_phone: '请输入手机号', btn_login: '立即认证', btn_processing: '正在认证...', btn_redirect: '正在跳转...', err_input: '请输入手机号', err_sys: '系统错误', succ_conn: '验证通过，正在联网...', succ_ok: '认证成功！正在跳转...', timeout: '连接超时，请尝试刷新' },
+            en: { title: '<span class="brand">KN</span> Guest Network Auth', ph_phone: 'Mobile Number', btn_login: 'Connect', btn_processing: 'Verifying...', btn_redirect: 'Redirecting...', err_input: 'Please enter mobile number', err_sys: 'System Error', succ_conn: 'Authorized. Connecting...', succ_ok: 'Success! Redirecting...', timeout: 'Timeout. Please refresh.' }
+        };
+        let currLang = 'cn';
+        function setLang(lang) {
+            currLang = lang;
+            document.getElementById('lang-cn').className = lang === 'cn' ? 'active' : '';
+            document.getElementById('lang-en').className = lang === 'en' ? 'active' : '';
+            const t = i18n[lang];
+            document.getElementById('ui-title').innerHTML = t.title;
+            document.getElementById('phone').placeholder = t.ph_phone;
+            const btn = document.getElementById('btn-login');
+            if(!btn.disabled) { btn.innerText = t.btn_login; }
+        }
+
+        function getParam(name) { return new URLSearchParams(window.location.search).get(name) || ""; }
+        const p = {
+            ip: getParam("wlanuserip") || getParam("userip") || "{{ .UserIP }}",
+            mac: getParam("wlanusermac") || getParam("usermac") || "{{ .UserMAC }}",
+            ap: getParam("apmac") || getParam("MAC") || "{{ .APMAC }}",
+            ssid: getParam("ssid") || "{{ .SSID }}",
+            acname: getParam("wlanacname") || "{{ .WlanACName }}"
+        };
+
+        let targetURL = "http://www.baidu.com";
+
+        async function login() {
+            const phone = document.getElementById('phone').value;
+            // 姓名直接使用手机号
+            if(!phone) return showMsg(i18n[currLang].err_input, 'red');
+
+            const btn = document.getElementById('btn-login');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> ' + i18n[currLang].btn_processing;
+            showMsg("", ""); 
+
+            try {
+                // 【逻辑保留】将 realname 字段设置为 phone
+                const res = await fetch('/portal/auth', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        username: phone, 
+                        realname: phone, 
+                        user_ip: p.ip, user_mac: p.mac, ap_mac: p.ap
+                    })
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    showMsg(i18n[currLang].succ_conn, "green");
+                    if(data.redirect_url) targetURL = data.redirect_url;
+                    
+                    // 【逻辑保留】根据 proto_ver 决定是否提交表单
+                    if (data.proto_ver === 0) {
+                        // HTTP 协议：提交表单
+                        const acUrl = "http://" + data.ac_ip + ":" + data.ac_port + data.login_path;
+                        document.getElementById('ac-username').value = phone;
+                        document.getElementById('ac-password').value = phone; 
+                        document.getElementById('ac-user').value = phone;
+                        document.getElementById('ac-ipaddress').value = p.ip || '127.0.0.1';
+                        document.getElementById('ac-wlanuserip').value = p.ip || '127.0.0.1';
+                        document.getElementById('ac-macaddress').value = p.mac || '';
+                        document.getElementById('ac-wlanusermac').value = p.mac || '';
+                        document.getElementById('ac-acname').value = p.acname || '';
+                        document.getElementById('ac-ssid').value = p.ssid || '';
+                        const form = document.getElementById('ac-form');
+                        form.action = acUrl;
+                        form.submit(); 
+                    } else {
+                        // Portal 协议：后端已认证，前端静默等待
+                    }
+                    
+                    startPolling();
+                } else {
+                    showMsg("Error: " + data.message, "red");
+                    resetBtn();
+                }
+            } catch (e) {
+                showMsg(i18n[currLang].err_sys, "red"); 
+                resetBtn();
+            }
+        }
+
+        function resetBtn() {
+            const btn = document.getElementById('btn-login');
+            btn.disabled = false;
+            btn.innerText = i18n[currLang].btn_login;
+        }
+
+        function startPolling() {
+            let attempts = 0;
+            const timer = setInterval(async () => {
+                attempts++;
+                try {
+                    const res = await fetch('/portal/status?ip=' + (p.ip || '') + '&mac=' + (p.mac || ''));
+                    const data = await res.json();
+                    
+                    if (data.online) {
+                        clearInterval(timer);
+                        showMsg(i18n[currLang].succ_ok, "green");
+                        document.getElementById('btn-login').innerText = i18n[currLang].btn_redirect;
+                        setTimeout(() => window.location.href = data.redirect_url || targetURL, 1000);
+                        return;
+                    }
+                } catch(e) {}
+                if (attempts >= 15) { 
+                    clearInterval(timer);
+                    showMsg(i18n[currLang].timeout, "orange");
+                    setTimeout(() => window.location.href = targetURL, 2000); 
+                }
+            }, 1000);
+        }
+        
+        window.onload = startPolling;
+
+        function showMsg(text, color) { 
+            const el = document.getElementById('message'); el.innerText = text; if(color) el.style.color = color;
+        }
+    </script>
+</body>
+</html>

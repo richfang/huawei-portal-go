@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Portal 管理后台</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; padding: 20px; background: #f0f2f5; color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 30px; }
+        .card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding-bottom: 15px; margin-bottom: 15px; }
+        h2 { margin: 0; font-size: 18px; color: #1f2d3d; }
+        
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f0f0f0; }
+        th { background: #fafafa; font-weight: 600; color: #666; }
+        tr:hover { background: #f9f9f9; }
+        
+        button { cursor: pointer; border: none; border-radius: 4px; padding: 6px 12px; font-size: 13px; transition: all 0.2s; }
+        .btn-primary { background: #1890ff; color: white; }
+        .btn-primary:hover { background: #40a9ff; }
+        .btn-danger { background: #ff4d4f; color: white; }
+        .btn-danger:hover { background: #ff7875; }
+        .btn-default { background: #fff; border: 1px solid #d9d9d9; color: #666; }
+        .btn-default:hover { color: #40a9ff; border-color: #40a9ff; }
+        
+        .status-badge { padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+        .status-success { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
+        .status-fail { background: #fff1f0; color: #f5222d; border: 1px solid #ffa39e; }
+
+        /* 简单的 Modal 样式 */
+        .modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.5); display: none; justify-content: center; align-items: center; z-index: 1000; }
+        .modal { background: white; width: 400px; padding: 25px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+        .modal h3 { margin-top: 0; margin-bottom: 20px; }
+        .form-item { margin-bottom: 15px; }
+        .form-item label { display: block; margin-bottom: 5px; font-weight: 500; font-size: 13px; }
+        .form-item input { width: 100%; padding: 8px; border: 1px solid #d9d9d9; border-radius: 4px; box-sizing: border-box; }
+        .modal-footer { text-align: right; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 style="margin-bottom: 30px;">Portal 认证管理后台</h1>
+
+        <div class="card">
+            <div class="card-header">
+                <h2>AP / AC 准入配置</h2>
+                <button class="btn-primary" onclick="openModal()">+ 新增配置</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>AP MAC 地址</th>
+                        <th>目标 AC IP</th>
+                        <th>AC 端口</th>
+                        <th>共享密钥 (Secret)</th>
+                        <th>创建时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="apac-list"></tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h2>在线用户</h2>
+                <button class="btn-default" onclick="loadOnline()">刷新</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>用户 (手机)</th>
+                        <th>IP 地址</th>
+                        <th>MAC 地址</th>
+                        <th>接入 AP</th>
+                        <th>登录时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="online-list"></tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h2>审计日志</h2>
+                <button class="btn-default" onclick="loadAudit()">刷新</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>时间</th>
+                        <th>用户</th>
+                        <th>IP</th>
+                        <th>AC IP</th>
+                        <th>动作</th>
+                        <th>结果</th>
+                        <th>详情</th>
+                    </tr>
+                </thead>
+                <tbody id="audit-list"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="modal">
+        <div class="modal">
+            <h3 id="modal-title">新增 AP/AC 配置</h3>
+            <input type="hidden" id="edit-id">
+            <div class="form-item">
+                <label>AP MAC 地址 (例如: 11-22-33-44-55-66)</label>
+                <input type="text" id="ap-mac" placeholder="请输入 AP MAC">
+            </div>
+            <div class="form-item">
+                <label>目标 AC IP (例如: 172.16.36.254)</label>
+                <input type="text" id="ac-ip" placeholder="请输入 AC IP">
+            </div>
+            <div class="form-item">
+                <label>AC 端口 (默认: 2000)</label>
+                <input type="number" id="ac-port" value="2000">
+            </div>
+            <div class="form-item">
+                <label>共享密钥 (Secret)</label>
+                <input type="text" id="ac-secret" value="Huawei">
+            </div>
+            <div class="modal-footer">
+                <button class="btn-default" onclick="closeModal()">取消</button>
+                <button class="btn-primary" onclick="saveConfig()">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // API Base
+        const API = {
+            APAC: '/admin/apac',
+            ONLINE: '/admin/online',
+            AUDIT: '/admin/audit',
+            KICK: '/admin/kick'
+        };
+
+        // --- AP/AC Config Logic ---
+        async function loadAPAC() {
+            const res = await fetch(API.APAC);
+            const list = await res.json();
+            document.getElementById('apac-list').innerHTML = list.map(item => `
+                <tr>
+                    <td>${item.APMAC}</td>
+                    <td>${item.ACIP}</td>
+                    <td>${item.ACPort}</td>
+                    <td>${item.ACSecret}</td>
+                    <td>${new Date(item.CreatedAt).toLocaleString()}</td>
+                    <td>
+                        <button class="btn-default" onclick='editConfig(${JSON.stringify(item)})'>编辑</button>
+                        <button class="btn-danger" onclick="delConfig(${item.ID})">删除</button>
+                    </td>
+                </tr>
+            `).join('');
+            if(list.length === 0) document.getElementById('apac-list').innerHTML = '<tr><td colspan="6" style="text-align:center;color:#999">暂无配置，请点击右上角新增</td></tr>';
+        }
+
+        function openModal() {
+            document.getElementById('modal').style.display = 'flex';
+            document.getElementById('modal-title').innerText = '新增 AP/AC 配置';
+            document.getElementById('edit-id').value = '';
+            document.getElementById('ap-mac').value = '';
+            document.getElementById('ac-ip').value = '';
+        }
+
+        function editConfig(item) {
+            openModal();
+            document.getElementById('modal-title').innerText = '编辑配置';
+            document.getElementById('edit-id').value = item.ID;
+            document.getElementById('ap-mac').value = item.APMAC;
+            document.getElementById('ac-ip').value = item.ACIP;
+            document.getElementById('ac-port').value = item.ACPort;
+            document.getElementById('ac-secret').value = item.ACSecret;
+        }
+
+        function closeModal() {
+            document.getElementById('modal').style.display = 'none';
+        }
+
+        async function saveConfig() {
+            const id = document.getElementById('edit-id').value;
+            const data = {
+                APMAC: document.getElementById('ap-mac').value,
+                ACIP: document.getElementById('ac-ip').value,
+                ACPort: parseInt(document.getElementById('ac-port').value),
+                ACSecret: document.getElementById('ac-secret').value
+            };
+            
+            if(id) data.ID = parseInt(id); // Update
+
+            try {
+                const res = await fetch(API.APAC, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                if(result.success) {
+                    closeModal();
+                    loadAPAC();
+                } else {
+                    alert('保存失败: ' + result.message);
+                }
+            } catch(e) { alert('请求错误'); }
+        }
+
+        async function delConfig(id) {
+            if(!confirm('确定要删除此配置吗？')) return;
+            await fetch(API.APAC + '/' + id, { method: 'DELETE' });
+            loadAPAC();
+        }
+
+        // --- Other Logic ---
+        async function loadOnline() {
+            const res = await fetch(API.ONLINE);
+            const list = await res.json();
+            document.getElementById('online-list').innerHTML = list.map(u => `
+                <tr>
+                    <td>${u.Username}</td>
+                    <td>${u.UserIP}</td>
+                    <td>${u.UserMAC}</td>
+                    <td>${u.APMAC}</td>
+                    <td>${new Date(u.LoginTime).toLocaleString()}</td>
+                    <td><button class="btn-danger" onclick="kick('${u.UserIP}')">强制下线</button></td>
+                </tr>
+            `).join('');
+        }
+
+        async function loadAudit() {
+            const res = await fetch(API.AUDIT);
+            const list = await res.json();
+            document.getElementById('audit-list').innerHTML = list.map(l => `
+                <tr>
+                    <td>${new Date(l.CreatedAt).toLocaleString()}</td>
+                    <td>${l.Username}</td>
+                    <td>${l.UserIP}</td>
+                    <td>${l.ACIP}</td>
+                    <td>${l.Action}</td>
+                    <td><span class="status-badge ${l.Result === 'SUCCESS' ? 'status-success' : 'status-fail'}">${l.Result}</span></td>
+                    <td>${l.Message}</td>
+                </tr>
+            `).join('');
+        }
+
+        async function kick(ip) {
+            if(!confirm('确定踢出?')) return;
+            await fetch(API.KICK + '?user_ip=' + ip, { method: 'POST' });
+            loadOnline();
+            loadAudit();
+        }
+
+        // Init
+        loadAPAC();
+        loadOnline();
+        loadAudit();
+    </script>
+</body>
+</html>

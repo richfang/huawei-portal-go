@@ -1,0 +1,682 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+const ProjectName = "."
+
+var files = map[string]string{
+	// 1. [Models] 增加 RealName 字段
+	"internal/models/models.go": `package models
+
+import (
+	"time"
+	"gorm.io/gorm"
+)
+
+type Guest struct {
+	gorm.Model
+	Username  string
+	RealName  string // 【新增】真实姓名
+	UserIP    string
+	UserMAC   string
+	APMAC     string
+	LoginTime time.Time
+	SessionID string
+}
+
+type AuditLog struct {
+	ID        uint ` + "`gorm:\"primarykey\"`" + `
+	Username  string
+	UserIP    string
+	UserMAC   string
+	APMAC     string
+	ACIP      string
+	Action    string
+	Result    string
+	Message   string
+	CreatedAt time.Time
+}
+
+type APACMap struct {
+	ID        uint ` + "`gorm:\"primarykey\"`" + `
+	APMAC     string
+	ACIP      string
+	ACPort    int
+	ACSecret  string
+	CreatedAt time.Time
+}
+
+type VerificationCode struct {
+	ID          uint ` + "`gorm:\"primarykey\"`" + `
+	PhoneNumber string
+	Code        string
+	IsUsed      bool
+	CreatedAt   time.Time
+}
+
+type Admin struct {
+	ID       uint ` + "`gorm:\"primarykey\"`" + `
+	Username string
+	Password string
+}
+
+type SystemConfig struct {
+	Key   string ` + "`gorm:\"primarykey\"`" + `
+	Value string
+}
+`,
+
+	// 2. [RADIUS] 修复 AP 信息丢失问题 (从 Called-Station-Id 提取)
+	"internal/radius/server.go": `package radius
+
+import (
+	"fmt"
+	"huawei-portal-go/internal/models"
+	"strings"
+	"time"
+
+	"layeh.com/radius"
+	"layeh.com/radius/rfc2865"
+	"layeh.com/radius/rfc2866"
+	"gorm.io/gorm"
+)
+
+type RadiusService struct {
+	DB *gorm.DB
+}
+
+func cleanMAC(mac string) string {
+	s := strings.ReplaceAll(mac, ":", "")
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, ".", "")
+	return strings.ToLower(s)
+}
+
+// 提取 AP MAC (格式通常为 MAC:SSID)
+func extractAPMAC(calledStationID string) string {
+	if calledStationID == "" { return "" }
+	parts := strings.Split(calledStationID, ":")
+	if len(parts) > 0 { return cleanMAC(parts[0]) }
+	return cleanMAC(calledStationID)
+}
+
+func (s *RadiusService) HandleAuth(w radius.ResponseWriter, r *radius.Request) {
+	username := rfc2865.UserName_GetString(r.Packet)
+	mac := rfc2865.CallingStationID_GetString(r.Packet)
+	fmt.Printf("[RADIUS Auth] Request from %s | User: %s | MAC: %s\n", r.RemoteAddr, username, mac)
+
+	code := radius.CodeAccessReject
+	cleanUser := cleanMAC(username)
+	
+	var guest models.Guest
+	query := s.DB.Raw("SELECT * FROM guests WHERE username = ? OR REPLACE(REPLACE(user_mac, ':', ''), '-', '') = ? ORDER BY login_time DESC LIMIT 1", username, cleanUser).Scan(&guest)
+
+	if query.Error == nil && guest.ID > 0 {
+		fmt.Printf("[RADIUS Auth] ✅ Success (Trust List): %s\n", username)
+		code = radius.CodeAccessAccept
+	} else {
+		var vc models.VerificationCode
+		if err := s.DB.Where("phone_number = ? AND code = ? AND is_used = 0", username, rfc2865.UserPassword_GetString(r.Packet)).First(&vc).Error; err == nil {
+			fmt.Printf("[RADIUS Auth] ✅ Success (SMS Code): %s\n", username)
+			code = radius.CodeAccessAccept
+		} else {
+			fmt.Println("[RADIUS Auth] ❌ Rejected")
+		}
+	}
+	w.Write(r.Response(code))
+}
+
+func (s *RadiusService) HandleAcct(w radius.ResponseWriter, r *radius.Request) {
+	username := rfc2865.UserName_GetString(r.Packet)
+	mac := cleanMAC(rfc2865.CallingStationID_GetString(r.Packet))
+	
+	// 【修复】获取 AP MAC
+	apMac := extractAPMAC(rfc2865.CalledStationID_GetString(r.Packet))
+
+	userIP := ""
+	if ip := rfc2865.FramedIPAddress_Get(r.Packet); ip != nil { userIP = ip.String() }
+
+	statusType := r.Packet.Get(rfc2866.AcctStatusType_Type)
+	statusVal := 0
+	if statusType != nil { val, _ := radius.Integer(statusType); statusVal = int(val) }
+
+	switch statusVal {
+	case 1: // Start
+		fmt.Printf("[RADIUS Acct] 🟢 User Online: %s | AP: %s\n", username, apMac)
+		var count int64
+		s.DB.Model(&models.Guest{}).Where("username = ?", username).Count(&count)
+		if count == 0 {
+			// 【修复】存入 APMAC
+			s.DB.Create(&models.Guest{
+				Username: username, UserIP: userIP, UserMAC: mac, 
+				APMAC: apMac, LoginTime: time.Now(), SessionID: "RADIUS-AUTO",
+			})
+		} else {
+			// 更新 IP 和 APMAC
+			s.DB.Model(&models.Guest{}).Where("username = ?", username).Updates(map[string]interface{}{"user_ip": userIP, "ap_mac": apMac})
+		}
+
+	case 2: // Stop
+		fmt.Printf("[RADIUS Acct] 🔴 User Offline: %s\n", username)
+		// 记录下线审计
+		var guest models.Guest
+		s.DB.Where("username = ?", username).First(&guest)
+		if guest.ID > 0 {
+			s.DB.Create(&models.AuditLog{
+				Username: guest.Username, UserIP: guest.UserIP, UserMAC: guest.UserMAC,
+				APMAC: guest.APMAC, Action: "LOGOUT", Result: "SUCCESS", Message: "Radius Accounting Stop", CreatedAt: time.Now(),
+			})
+		}
+		s.DB.Where("username = ? OR user_ip = ?", username, userIP).Delete(&models.Guest{})
+
+	case 3: // Interim-Update
+		s.DB.Model(&models.Guest{}).Where("username = ?", username).Update("login_time", time.Now())
+		if apMac != "" { s.DB.Model(&models.Guest{}).Where("username = ?", username).Update("ap_mac", apMac) }
+
+	case 7, 8: // Accounting-On/Off
+		s.DB.Exec("DELETE FROM guests")
+	}
+	w.Write(r.Response(radius.CodeAccountingResponse))
+}
+
+func StartRadiusServer(db *gorm.DB, secret string) {
+	handler := &RadiusService{DB: db}
+	server := radius.PacketServer{Addr: ":1812", Handler: radius.HandlerFunc(handler.HandleAuth), SecretSource: radius.StaticSecretSource([]byte(secret))}
+	fmt.Printf("RADIUS Auth Server listening on :1812...\n")
+	server.ListenAndServe()
+}
+
+func StartAcctServer(db *gorm.DB, secret string) {
+	handler := &RadiusService{DB: db}
+	server := radius.PacketServer{Addr: ":1813", Handler: radius.HandlerFunc(handler.HandleAcct), SecretSource: radius.StaticSecretSource([]byte(secret))}
+	fmt.Printf("RADIUS Acct Server listening on :1813...\n")
+	server.ListenAndServe()
+}
+`,
+
+	// 3. [Service] LoginCheck 增加 realName 参数
+	"internal/service/auth_service.go": `package service
+
+import (
+	"errors"
+	"fmt"
+	"huawei-portal-go/internal/models"
+	"huawei-portal-go/internal/radius"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+type AuthService struct {
+	DB *gorm.DB
+}
+
+func NewAuthService(db *gorm.DB) *AuthService {
+	return &AuthService{DB: db}
+}
+
+func cleanMAC(mac string) string {
+	s := strings.ReplaceAll(mac, ":", "")
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, ".", "")
+	return strings.ToLower(s)
+}
+
+func (s *AuthService) kickViaPortalSpecial(acIP string, userIP string) error {
+	baseURL := fmt.Sprintf("http://%s:8000/login", acIP)
+	params := url.Values{}
+	params.Set("cmd", "disconnect")
+	params.Set("ip-address", userIP)
+	payload := params.Encode()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	localAddr, err := net.ResolveTCPAddr("tcp", ":50100")
+	if err == nil {
+		dialer := &net.Dialer{LocalAddr: localAddr, Timeout: 2 * time.Second}
+		client.Transport = &http.Transport{DialContext: dialer.DialContext, DisableKeepAlives: true}
+	}
+
+	fmt.Printf("[Kick] Sending to %s (Payload: %s)\n", baseURL, payload)
+	req, _ := http.NewRequest("POST", baseURL, strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Compatible; Huawei-Portal)")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("[Kick] POST Failed: %v. Retrying with GET...\n", err)
+		req, _ = http.NewRequest("GET", baseURL+"?"+payload, nil)
+		resp, err = client.Do(req)
+	}
+	if err != nil { return err }
+	defer resp.Body.Close()
+	return nil
+}
+
+func (s *AuthService) ManualLogout(userIP string) error {
+	var guest models.Guest
+	if err := s.DB.Where("user_ip = ?", userIP).First(&guest).Error; err != nil {
+		fmt.Println("[Kick] User not found in DB, trying blind kick...")
+	}
+	var apMac string
+	if guest.ID > 0 { apMac = guest.APMAC }
+	ac, _ := s.getACConfig(apMac) 
+
+	if guest.UserMAC != "" { radius.SendDisconnect(ac.ACIP, ac.ACSecret, guest.UserMAC, userIP) }
+	s.kickViaPortalSpecial(ac.ACIP, userIP)
+	s.DB.Where("user_ip = ?", userIP).Delete(&models.Guest{})
+	s.logAudit(guest.Username, userIP, guest.UserMAC, apMac, ac.ACIP, "KICK", "SUCCESS", "Admin Manual Kick")
+	return nil
+}
+
+// 【修改】LoginCheck 接收 realName
+func (s *AuthService) LoginCheck(username, password, realName, userIP, userMAC, apMac string) (string, *models.APACMap, error) {
+	ac, _ := s.getACConfig(apMac)
+
+	// 暂时禁用登录前清理
+	// go func() { radius.SendDisconnect(ac.ACIP, ac.ACSecret, userMAC, userIP); s.kickViaPortalSpecial(ac.ACIP, userIP) }()
+
+	s.DB.Where("username = ? OR user_ip = ? OR user_mac = ?", username, userIP, userMAC).Delete(&models.Guest{})
+	// 【修改】保存 RealName
+	s.DB.Create(&models.Guest{
+		Username: username, RealName: realName, UserIP: userIP, UserMAC: userMAC, 
+		APMAC: apMac, SessionID: fmt.Sprintf("HTTP-%d", time.Now().Unix()), 
+		LoginTime: time.Now(),
+	})
+	s.logAudit(username, userIP, userMAC, apMac, ac.ACIP, "LOGIN", "SUCCESS", "Standard Auth")
+	return s.GetConfig("redirect_url"), &ac, nil
+}
+
+func (s *AuthService) getACConfig(apMac string) (models.APACMap, error) {
+	var config models.APACMap
+	cleanInput := cleanMAC(apMac)
+	err := s.DB.Raw("SELECT * FROM apac_maps WHERE LOWER(REPLACE(REPLACE(REPLACE(apmac, ':', ''), '-', ''), '.', '')) = ? LIMIT 1", cleanInput).Scan(&config).Error
+	if err == nil && config.ID > 0 { return config, nil }
+	return models.APACMap{ACIP: "172.16.36.254", ACPort: 8000, ACSecret: "Huawei"}, nil
+}
+func (s *AuthService) AddToTrustList(u, r, i, m, a string) (*models.APACMap, error) { _, ac, err := s.LoginCheck(u, "", r, i, m, a); return ac, err }
+func (s *AuthService) GetConfig(key string) string {
+	var conf models.SystemConfig
+	if err := s.DB.First(&conf, "` + "`key`" + ` = ?", key).Error; err != nil {
+		if key == "redirect_url" { return "http://www.baidu.com" }
+		return ""
+	}
+	return conf.Value
+}
+func (s *AuthService) SaveConfig(key, value string) error { return s.DB.Save(&models.SystemConfig{Key: key, Value: value}).Error }
+func (s *AuthService) GetDashboardStats() map[string]int64 {
+	var o, a, t int64
+	s.DB.Model(&models.Guest{}).Count(&o)
+	s.DB.Model(&models.APACMap{}).Count(&a)
+	s.DB.Model(&models.AuditLog{}).Where("action=? AND result=? AND created_at>=?", "LOGIN", "SUCCESS", time.Now().Format("2006-01-02")).Count(&t)
+	return map[string]int64{"online":o,"ap_count":a,"today_auth":t}
+}
+func (s *AuthService) SaveAPAC(item *models.APACMap) error {
+	if item.ID == 0 { 
+		var count int64
+		clean := cleanMAC(item.APMAC)
+		s.DB.Model(&models.APACMap{}).Where("LOWER(REPLACE(REPLACE(REPLACE(apmac, ':', ''), '-', ''), '.', '')) = ?", clean).Count(&count)
+		if count > 0 { return errors.New("该 AP MAC 已存在") }
+		item.CreatedAt = time.Now()
+		return s.DB.Create(item).Error
+	}
+	return s.DB.Model(item).Omit("CreatedAt").Save(item).Error
+}
+func (s *AuthService) UpdatePassword(u, o, n string) error {
+	var a models.Admin; if err := s.DB.Where("username=? AND password=?", u, o).First(&a).Error; err!=nil{return err}
+	a.Password=n; return s.DB.Save(&a).Error
+}
+func (s *AuthService) SendCode(phone string) error { return nil }
+func (s *AuthService) verifyCode(phone, code string) error { return nil }
+func (s *AuthService) GetOnlineUsers() ([]models.Guest, error) { var u []models.Guest; s.DB.Find(&u); return u, nil }
+func (s *AuthService) GetAuditLogs() ([]models.AuditLog, error) { var l []models.AuditLog; s.DB.Limit(50).Order("created_at desc").Find(&l); return l, nil }
+func (s *AuthService) GetAPACList() ([]models.APACMap, error) { var l []models.APACMap; s.DB.Find(&l); return l, nil }
+func (s *AuthService) DeleteAPAC(id uint) error { return s.DB.Delete(&models.APACMap{}, id).Error }
+func (s *AuthService) CheckOnline(userIP string) (*models.Guest, error) { var g models.Guest; if err := s.DB.Where("user_ip = ?", userIP).First(&g).Error; err != nil { return nil, err }; return &g, nil }
+func (s *AuthService) GetACConfigByIP(userIP string) (models.APACMap, error) { return s.getACConfig("") }
+func (s *AuthService) logAudit(user, ip, mac, ap, ac, action, res, msg string) {
+	s.DB.Create(&models.AuditLog{Username: user, UserIP: ip, UserMAC: mac, APMAC: ap, ACIP: ac, Action: action, Result: res, Message: msg, CreatedAt: time.Now()})
+}
+`,
+
+	// 4. [Main] 传递 RealName
+	"cmd/server/main.go": `package main
+
+import (
+	"fmt"
+	"huawei-portal-go/internal/models"
+	"huawei-portal-go/internal/radius"
+	"huawei-portal-go/internal/service"
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+func AdminAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		_, err := c.Cookie("admin_session")
+		if err != nil {
+			if c.GetHeader("X-Requested-With") == "XMLHttpRequest" {
+				c.AbortWithStatusJSON(401, gin.H{"success": false, "message": "登录已过期"})
+				return
+			}
+			c.Redirect(http.StatusFound, "/login-admin")
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+func main() {
+	dsn := "root:Qsq915open.@tcp(172.16.24.8:3306)/guest_database?charset=utf8mb4&parseTime=True&loc=Local"
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil { panic(err) }
+	
+	db.AutoMigrate(&models.Guest{}, &models.AuditLog{}, &models.APACMap{}, &models.VerificationCode{}, &models.Admin{}, &models.SystemConfig{})
+
+	var count int64
+	db.Model(&models.SystemConfig{}).Where("` + "`key`" + ` = ?", "redirect_url").Count(&count)
+	if count == 0 { db.Create(&models.SystemConfig{Key: "redirect_url", Value: "http://www.baidu.com"}) }
+	
+	db.Model(&models.Admin{}).Count(&count)
+	if count == 0 { db.Create(&models.Admin{Username: "admin", Password: "password123"}) }
+
+	go radius.StartRadiusServer(db, "qsq915open") 
+	go radius.StartAcctServer(db, "qsq915open")
+
+	authService := service.NewAuthService(db)
+
+	r := gin.Default()
+	r.LoadHTMLGlob("templates/*")
+
+	r.GET("/", func(c *gin.Context) {
+		userIP := c.Query("wlanuserip"); if userIP == "" { userIP = c.Query("userip") }; if userIP == "" { userIP = c.ClientIP() }
+		redirectURL := c.Query("url"); if redirectURL == "" { redirectURL = c.Query("redirect-url") }; if redirectURL == "" { redirectURL = c.Query("wlanoriginalurl") }; if redirectURL == "" { redirectURL = "http://www.baidu.com" }
+
+		if onlineUser, err := authService.CheckOnline(userIP); err == nil {
+			ac, _ := authService.GetACConfigByIP(userIP)
+			c.HTML(http.StatusOK, "success.html", gin.H{"UserIP": userIP, "Username": onlineUser.Username, "ACIP": ac.ACIP, "ACPort": ac.ACPort})
+			return
+		}
+		c.HTML(http.StatusOK, "login.html", gin.H{"UserIP": c.Query("wlanuserip"), "UserMAC": c.Query("wlanusermac"), "APMAC": c.Query("apmac"), "RedirectURL": redirectURL, "SSID": c.Query("ssid"), "WlanACName": c.Query("wlanacname")})
+	})
+
+	r.GET("/login-admin", func(c *gin.Context) { c.HTML(http.StatusOK, "admin_login.html", nil) })
+
+	r.POST("/api/admin/login", func(c *gin.Context) {
+		var req struct { Username string; Password string }
+		c.ShouldBindJSON(&req)
+		var admin models.Admin
+		if err := db.Where("username = ? AND password = ?", req.Username, req.Password).First(&admin).Error; err != nil {
+			c.JSON(200, gin.H{"success": false, "message": "账号或密码错误"})
+			return
+		}
+		c.SetCookie("admin_session", admin.Username, 86400, "/", "", false, true)
+		c.JSON(200, gin.H{"success": true})
+	})
+
+	r.POST("/portal/auth", func(c *gin.Context) {
+		var req struct {
+			Username string ` + "`" + `json:"username"` + "`" + `
+			Password string ` + "`" + `json:"password"` + "`" + `
+			RealName string ` + "`" + `json:"realname"` + "`" + ` // 【新增】接收前端姓名
+			UserIP   string ` + "`" + `json:"user_ip"` + "`" + `
+			UserMAC  string ` + "`" + `json:"user_mac"` + "`" + `
+			APMAC    string ` + "`" + `json:"ap_mac"` + "`" + `
+		}
+		c.ShouldBindJSON(&req)
+		if req.UserIP == "" { req.UserIP = c.ClientIP() }
+
+		// 【修改】传入 RealName
+		redirectURL, acConfig, err := authService.LoginCheck(req.Username, req.Password, req.RealName, req.UserIP, req.UserMAC, req.APMAC)
+		if err != nil { c.JSON(500, gin.H{"success": false, "message": err.Error()}); return }
+		c.JSON(200, gin.H{"success": true, "ac_ip": acConfig.ACIP, "ac_port": acConfig.ACPort, "login_path": "/login", "redirect_url": redirectURL})
+	})
+	
+	r.GET("/portal/status", func(c *gin.Context) {
+		userIP := c.Query("ip"); if userIP == "" { userIP = c.ClientIP() }
+		if _, err := authService.CheckOnline(userIP); err == nil { c.JSON(200, gin.H{"online": true, "redirect_url": authService.GetConfig("redirect_url")}) } else { c.JSON(200, gin.H{"online": false}) }
+	})
+	r.POST("/portal/send-code", func(c *gin.Context) { c.JSON(200, gin.H{"success": true}) })
+
+	admin := r.Group("/admin")
+	admin.Use(AdminAuth())
+	{
+		admin.GET("/", func(c *gin.Context) { c.HTML(http.StatusOK, "admin_dashboard.html", nil) })
+		admin.GET("/logout", func(c *gin.Context) { c.SetCookie("admin_session", "", -1, "/", "", false, true); c.Redirect(http.StatusFound, "/login-admin") })
+		admin.GET("/stats", func(c *gin.Context) { c.JSON(200, authService.GetDashboardStats()) })
+		admin.GET("/config", func(c *gin.Context) { c.JSON(200, gin.H{"value": authService.GetConfig(c.Query("key"))}) })
+		admin.POST("/config", func(c *gin.Context) { var req struct{ Key, Value string }; c.ShouldBindJSON(&req); authService.SaveConfig(req.Key, req.Value); c.JSON(200, gin.H{"success": true}) })
+		admin.POST("/kick", func(c *gin.Context) { userIP := c.Query("user_ip"); var req struct{ UserIP string ` + "`" + `json:"user_ip"` + "`" + ` }; if c.ShouldBindJSON(&req) == nil && req.UserIP != "" { userIP = req.UserIP }; authService.ManualLogout(userIP); c.JSON(200, gin.H{"success": true}) })
+		admin.GET("/online", func(c *gin.Context) { users, _ := authService.GetOnlineUsers(); c.JSON(200, users) })
+		admin.GET("/audit", func(c *gin.Context) { logs, _ := authService.GetAuditLogs(); c.JSON(200, logs) })
+		admin.GET("/apac", func(c *gin.Context) { list, _ := authService.GetAPACList(); c.JSON(200, list) })
+		admin.POST("/apac", func(c *gin.Context) { var i models.APACMap; c.ShouldBindJSON(&i); authService.SaveAPAC(&i); c.JSON(200, gin.H{"success": true}) })
+		admin.DELETE("/apac/:id", func(c *gin.Context) { id, _ := strconv.Atoi(c.Param("id")); authService.DeleteAPAC(uint(id)); c.JSON(200, gin.H{"success": true}) })
+		admin.POST("/password", func(c *gin.Context) { var req struct{ OldPassword, NewPassword string }; c.ShouldBindJSON(&req); u, _ := c.Cookie("admin_session"); if err := authService.UpdatePassword(u, req.OldPassword, req.NewPassword); err != nil { c.JSON(200, gin.H{"success": false, "message": err.Error()}); return }; c.JSON(200, gin.H{"success": true}) })
+	}
+	fmt.Println("Server starting on :8080...")
+	r.Run(":8080")
+}
+`,
+
+	// 5. [Frontend] Dashboard 增加姓名列
+	"templates/admin_dashboard.html": `<!DOCTYPE html>
+<html>
+<head>
+    <title>Portal 管理中心</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: -apple-system, sans-serif; margin: 0; display: flex; height: 100vh; background: #f0f2f5; }
+        .sidebar { width: 240px; background: #001529; color: white; display: flex; flex-direction: column; }
+        .logo { height: 64px; line-height: 64px; text-align: center; font-size: 20px; font-weight: bold; background: #002140; }
+        .menu-item { padding: 16px 24px; cursor: pointer; color: #a6adb4; transition: 0.3s; font-size: 14px; }
+        .menu-item:hover, .menu-item.active { background: #1890ff; color: white; }
+        .logout { margin-top: auto; padding: 16px 24px; background: #002140; cursor: pointer; text-align: center; color: #fff; }
+        .main { flex: 1; padding: 24px; overflow-y: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+        h2 { margin: 0; color: #333; font-weight: 500; }
+        .section { display: none; }
+        .section.active { display: block; }
+        .card { background: white; padding: 24px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+        .stats-grid { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-card { flex: 1; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); display: flex; align-items: center; }
+        .stat-icon { width: 50px; height: 50px; border-radius: 50%; background: #e6f7ff; color: #1890ff; display: flex; align-items: center; justify-content: center; font-size: 24px; margin-right: 15px; }
+        .stat-info div:first-child { color: #8c8c8c; font-size: 14px; }
+        .stat-info div:last-child { font-size: 24px; font-weight: bold; color: #333; margin-top: 5px; }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 10px; }
+        th, td { text-align: left; padding: 16px 12px; border-bottom: 1px solid #e8e8e8; }
+        th { background: #fafafa; font-weight: 500; color: #555; }
+        button { cursor: pointer; border: none; padding: 6px 12px; border-radius: 4px; font-size: 14px; }
+        .btn-primary { background: #1890ff; color: white; }
+        .btn-danger { background: #ff4d4f; color: white; }
+        .btn-default { background: #fff; border: 1px solid #d9d9d9; color: #666; margin-left: 8px; }
+        .form-row { margin-bottom: 15px; }
+        .form-row label { display: block; margin-bottom: 6px; font-weight: 500; font-size: 14px; }
+        .form-row input { width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; box-sizing: border-box; }
+        .modal-overlay { position: fixed; top:0;left:0;width:100%;height:100%; background:rgba(0,0,0,0.5); display:none; align-items:center; justify-content:center; z-index: 999; }
+        .modal { background:white; padding:30px; width:420px; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+        .modal h3 { margin-top: 0; margin-bottom: 20px; }
+        .modal-footer { text-align:right; margin-top:25px; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo">Portal Admin</div>
+        <div class="menu-item active" onclick="switchTab('dashboard')">📊 仪表盘</div>
+        <div class="menu-item" onclick="switchTab('online')">📡 在线用户</div>
+        <div class="menu-item" onclick="switchTab('audit')">📝 历史审计</div>
+        <div class="menu-item" onclick="switchTab('apac')">⚙️ AP/AC 配置</div>
+        <div class="menu-item" onclick="switchTab('config')">🛠️ 系统设置</div>
+        <div class="menu-item" onclick="switchTab('security')">🔒 账户安全</div>
+        <a href="/admin/logout" style="text-decoration:none;"><div class="logout">退出登录</div></a>
+    </div>
+
+    <div class="main">
+        <div id="section-dashboard" class="section active">
+            <div class="header"><h2>系统概览</h2><button class="btn-default" onclick="loadStats()">刷新</button></div>
+            <div class="stats-grid">
+                <div class="stat-card"><div class="stat-icon">👥</div><div class="stat-info"><div>当前在线</div><div id="stat-online">0</div></div></div>
+                <div class="stat-card"><div class="stat-icon">📡</div><div class="stat-info"><div>已配 AP</div><div id="stat-ap">0</div></div></div>
+                <div class="stat-card"><div class="stat-icon">✅</div><div class="stat-info"><div>今日认证</div><div id="stat-auth">0</div></div></div>
+            </div>
+        </div>
+
+        <div id="section-config" class="section">
+            <div class="header"><h2>系统参数</h2></div>
+            <div class="card" style="max-width: 500px;">
+                <div class="form-row"><label>认证成功跳转地址</label><input id="conf-redirect" placeholder="http://..."></div>
+                <button class="btn-primary" onclick="saveConfig()">保存设置</button>
+            </div>
+        </div>
+
+        <div id="section-online" class="section">
+            <div class="header"><h2>在线用户</h2><button class="btn-default" onclick="loadOnline()">刷新</button></div>
+            <div class="card">
+                <table><thead><tr><th>用户</th><th>姓名</th><th>IP</th><th>MAC</th><th>AP</th><th>时间</th><th>操作</th></tr></thead><tbody id="online-list"></tbody></table>
+            </div>
+        </div>
+
+        <div id="section-audit" class="section">
+            <div class="header"><h2>历史审计</h2><button class="btn-default" onclick="loadAudit()">刷新</button></div>
+            <div class="card">
+                <table><thead><tr><th>时间</th><th>用户</th><th>IP</th><th>MAC</th><th>AP</th><th>动作</th><th>结果</th></tr></thead><tbody id="audit-list"></tbody></table>
+            </div>
+        </div>
+
+        <div id="section-apac" class="section">
+            <div class="header"><h2>设备配置</h2><div><button class="btn-primary" onclick="openModal()">+ 新增</button><button class="btn-default" onclick="loadAPAC()">刷新</button></div></div>
+            <div class="card">
+                <table><thead><tr><th>AP MAC</th><th>AC IP</th><th>端口</th><th>Secret</th><th>操作</th></tr></thead><tbody id="apac-list"></tbody></table>
+            </div>
+        </div>
+
+        <div id="section-security" class="section">
+            <div class="header"><h2>修改密码</h2></div>
+            <div class="card" style="max-width: 400px;">
+                <div class="form-row"><label>原密码</label><input type="password" id="pwd-old"></div>
+                <div class="form-row"><label>新密码</label><input type="password" id="pwd-new"></div>
+                <button class="btn-primary" onclick="changePassword()" style="width:100%">确认修改</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="modal">
+        <div class="modal">
+            <h3 id="modal-title">配置 AP/AC</h3>
+            <input type="hidden" id="edit-id">
+            <div class="form-row"><label>AP MAC</label><input id="form-ap"></div>
+            <div class="form-row"><label>AC IP</label><input id="form-ac"></div>
+            <div class="form-row"><label>AC Port</label><input id="form-port" value="2000"></div>
+            <div class="form-row"><label>Secret</label><input id="form-secret" value="Huawei"></div>
+            <div class="modal-footer"><button class="btn-default" onclick="closeModal()">取消</button><button class="btn-primary" onclick="saveAPAC()">保存</button></div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tab) {
+            document.querySelectorAll('.menu-item').forEach(el => el.classList.remove('active'));
+            event.target.classList.add('active');
+            document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
+            document.getElementById('section-' + tab).classList.add('active');
+            if(tab === 'dashboard') loadStats();
+            if(tab === 'config') loadConfig();
+            if(tab === 'online') loadOnline();
+            if(tab === 'audit') loadAudit();
+            if(tab === 'apac') loadAPAC();
+        }
+
+        async function loadStats() {
+            const res = await fetch('/admin/stats'); const d = await res.json();
+            document.getElementById('stat-online').innerText = d.online;
+            document.getElementById('stat-ap').innerText = d.ap_count;
+            document.getElementById('stat-auth').innerText = d.today_auth;
+        }
+        async function loadConfig() { const res = await fetch('/admin/config?key=redirect_url'); const d = await res.json(); document.getElementById('conf-redirect').value = d.value; }
+        async function saveConfig() { await fetch('/admin/config', { method:'POST', body:JSON.stringify({key:'redirect_url', value:document.getElementById('conf-redirect').value}) }); alert('保存成功'); }
+        
+        async function loadOnline() {
+            const res = await fetch('/admin/online'); const d = await res.json();
+            // 【新增】显示 RealName
+            document.getElementById('online-list').innerHTML = d.map(u => '<tr><td>'+u.Username+'</td><td>'+(u.RealName||'-')+'</td><td>'+u.UserIP+'</td><td>'+u.UserMAC+'</td><td>'+u.APMAC+'</td><td>'+new Date(u.LoginTime).toLocaleString()+'</td><td><button class="btn-danger" onclick="kick(\''+u.UserIP+'\')">下线</button></td></tr>').join('') || '<tr><td colspan="7" style="text-align:center;color:#999;padding:20px">暂无在线用户</td></tr>';
+        }
+        
+        async function loadAudit() {
+            const res = await fetch('/admin/audit'); const d = await res.json();
+            document.getElementById('audit-list').innerHTML = d.map(l => '<tr><td>'+new Date(l.CreatedAt).toLocaleString()+'</td><td>'+l.Username+'</td><td>'+l.UserIP+'</td><td>'+(l.UserMAC||'-')+'</td><td>'+l.APMAC+'</td><td>'+l.Action+'</td><td>'+l.Result+'</td></tr>').join('');
+        }
+        
+        async function loadAPAC() {
+            const res = await fetch('/admin/apac'); const d = await res.json();
+            document.getElementById('apac-list').innerHTML = d.map(i => 
+                '<tr><td>'+i.APMAC+'</td><td>'+i.ACIP+'</td><td>'+i.ACPort+'</td><td>'+i.ACSecret+'</td>'+
+                '<td><button class="btn-primary" onclick=\'editAPAC('+JSON.stringify(i)+')\'>编辑</button> <button class="btn-danger" onclick="delAPAC('+i.ID+')">删除</button></td></tr>'
+            ).join('');
+        }
+        
+        function openModal() { 
+            document.getElementById('modal').style.display='flex'; document.getElementById('modal-title').innerText="新增配置";
+            document.getElementById('edit-id').value=''; 
+            document.getElementById('form-ap').value=''; document.getElementById('form-ac').value=''; 
+            document.getElementById('form-port').value='2000'; document.getElementById('form-secret').value='Huawei';
+        }
+        
+        function editAPAC(i) { 
+            openModal(); document.getElementById('modal-title').innerText="编辑配置";
+            document.getElementById('edit-id').value=i.ID; 
+            document.getElementById('form-ap').value=i.APMAC; 
+            document.getElementById('form-ac').value=i.ACIP;
+            document.getElementById('form-port').value=i.ACPort;
+            document.getElementById('form-secret').value=i.ACSecret;
+        }
+
+        async function kick(ip) { if(confirm('确定下线?')) await fetch('/admin/kick?user_ip='+ip, {method:'POST'}); loadOnline(); }
+        async function delAPAC(id) { if(confirm('删除?')) await fetch('/admin/apac/'+id, {method:'DELETE'}); loadAPAC(); }
+        function closeModal() { document.getElementById('modal').style.display='none'; }
+        async function saveAPAC() {
+            const body = { 
+                ID: parseInt(document.getElementById('edit-id').value)||0, 
+                APMAC: document.getElementById('form-ap').value, 
+                ACIP: document.getElementById('form-ac').value, 
+                ACPort: parseInt(document.getElementById('form-port').value), 
+                ACSecret: document.getElementById('form-secret').value 
+            };
+            await fetch('/admin/apac', {method:'POST', body:JSON.stringify(body)}); closeModal(); loadAPAC();
+        }
+        async function changePassword() {
+            const o=document.getElementById('pwd-old').value, n=document.getElementById('pwd-new').value;
+            const res = await fetch('/admin/password', {method:'POST', body:JSON.stringify({OldPassword:o, NewPassword:n})});
+            const d = await res.json(); alert(d.message || (d.success ? '修改成功' : '失败'));
+        }
+
+        loadStats();
+    </script>
+</body>
+</html>
+`,
+}
+
+func main() {
+	fmt.Printf("Applying Complete Update (RealName + AP Info Fix + Sync)...%s\n", ProjectName)
+	for path, content := range files {
+		fullPath := filepath.Join(ProjectName, path)
+		dir := filepath.Dir(fullPath)
+		os.MkdirAll(dir, 0755)
+		os.WriteFile(fullPath, []byte(content), 0644)
+		fmt.Printf("Updated: %s\n", fullPath)
+	}
+	fmt.Println("Done! Please run: go run cmd/server/main.go")
+}
